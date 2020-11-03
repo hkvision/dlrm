@@ -1,11 +1,16 @@
+import time
 import numpy as np
 from pyspark.sql import SQLContext
 from pyspark.sql.types import *
 from pyspark.sql.functions import col, udf, array
 from pyspark.ml.feature import StringIndexer
-from zoo import init_nncontext
+from zoo.orca import init_orca_context
 
-sc = init_nncontext()
+hdfs_path = "hdfs://172.16.0.103:9000/dlrm/train.txt"
+# path = "/opt/work/client/kai/recommendation/kaggle/"
+path = "/home/kai/Downloads/dac_sample/dac/zoo/"
+sc = init_orca_context(cores=16, memory="20g")
+# sc = init_orca_context(cluster_mode="yarn", num_nodes=2, cores=44, memory="20g", driver_memory="40g")
 sqlContext = SQLContext.getOrCreate(sc)
 spark = sqlContext.sparkSession
 
@@ -19,7 +24,9 @@ int_fields_name = [field.name for field in int_fields]
 str_fields_name = [field.name for field in str_fields]
 
 schema = StructType(label_fields + int_fields + str_fields)
-df = spark.read.schema(schema).option("sep", "\t").csv("/home/kai/Downloads/dac_sample/dac/train.txt")
+start = time.time()
+df = spark.read.schema(schema).option("sep", "\t").csv(path + "train.txt")
+# df = spark.read.schema(schema).option("sep", "\t").csv(hdfs_path)
 
 fillNA = udf(lambda value: "0" if value == "" or value == "\n" or value is None else value)
 convertToInt = udf(lambda value: int(value, 16), IntegerType())
@@ -44,6 +51,7 @@ df = df.withColumn("X_cat", array(str_cols))
 df = df.select("y", "X_int", "X_cat")
 
 df.show(5)
+print(df.count())
 
 rows = df.collect()
 X_int = np.array([row[1] for row in rows], dtype=np.int32)
@@ -51,7 +59,7 @@ X_cat = np.array([row[2] for row in rows])
 y = np.array([row[0] for row in rows], dtype=np.int32)
 
 np.savez_compressed(
-            "/home/kai/Downloads/dac_sample/dac/spark_processed.npz",
+            path + "spark_processed.npz",
             X_cat=X_cat,
             X_int=X_int,
             y=y,
@@ -64,7 +72,12 @@ total_per_file = [num_data_per_split] * days
 for j in range(extras):
     total_per_file[j] += 1
 
-np.savez_compressed("/home/kai/Downloads/dac_sample/dac/zoo/train_day_count.npz",
+np.savez_compressed(path + "train_day_count.npz",
                     total_per_file=np.array(total_per_file, dtype=np.int32))
 
+np.savez_compressed(path + "train_fea_count.npz",
+                    counts=np.array(feature_count, dtype=np.int32))
+
+end = time.time()
+print("Time used: ", end - start)
 sc.stop()

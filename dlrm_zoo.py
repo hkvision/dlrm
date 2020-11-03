@@ -895,5 +895,6 @@ if __name__ == "__main__":
         backend="pytorch")
 
     stats = estimator.fit(train_data_creator, epochs=args.nepochs)
+    print(stats)
     val_stats = estimator.evaluate(test_data_creator)
     print(val_stats)
