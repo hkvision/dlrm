@@ -1,7 +1,5 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
-import os
 import sys
-import uuid
 import time
 import pickle
 import argparse
@@ -12,17 +10,9 @@ from pyspark.sql.functions import col, udf, array
 from zoo.orca import init_orca_context, stop_orca_context
 from zoo.orca.learn.pytorch import Estimator
 
-
-
 # miscellaneous
 import builtins
-import functools
-# import bisect
-# import shutil
 import json
-# data generation
-import dlrm_data_pytorch_modified as dp
-
 
 # pytorch
 import torch
@@ -442,52 +432,6 @@ def dash_separated_floats(value):
     return value
 
 
-def train_data_creator(config):
-    train_dataset = dp.CriteoDataset(
-            config["data_set"],
-            config["max_ind_range"],
-            config["data_sub_sample_rate"],
-            config["data_randomize"],
-            "train",
-            config["raw_data_file"],
-            config["executor_data_path"],
-            config["memory_map"],
-            config["dataset_multiprocessing"])
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config["mini_batch_size"],
-        shuffle=False,
-        num_workers=config["num_workers"],
-        collate_fn=dp.collate_wrapper_criteo,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
-    return train_loader
-
-
-def test_data_creator(config):
-    test_dataset = dp.CriteoDataset(
-            config["data_set"],
-            config["max_ind_range"],
-            config["data_sub_sample_rate"],
-            config["data_randomize"],
-            "test",
-            config["raw_data_file"],
-            config["executor_data_path"],
-            config["memory_map"],
-            config["dataset_multiprocessing"])
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=config["test_mini_batch_size"],
-        shuffle=False,
-        num_workers=config["test_num_workers"],
-        collate_fn=dp.collate_wrapper_criteo,
-        pin_memory=False,
-        drop_last=False,  # True
-    )
-    return test_loader
-
-
 def model_creator(config):
     dlrm = DLRM_Net(
         config["m_spa"],
@@ -516,38 +460,6 @@ def optimizer_creator(model, config):
 def scheduler_creator(optimizer, config):
     LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
                       config["lr_num_decay_steps"])
-
-
-def save(path):
-    def save_func(index, iterator):
-        if not os.path.isdir(path):
-            from filelock import FileLock
-            with FileLock("data.lock"):
-                os.mkdir(path)
-        data = list(iterator)
-        X_int = np.array([row[1] for row in data], dtype=np.int32)
-        X_cat = np.array([row[2] for row in data], dtype=np.int32)
-        y = np.array([row[0] for row in data], dtype=np.int32)
-        np.savez_compressed(path + "/spark_processed_" + str(index) + ".npz",
-                            X_cat=X_cat,
-                            X_int=X_int,
-                            y=y)
-        yield 0
-
-    return save_func
-
-
-def remove(path):
-    def remove_func(iterator):
-        data = list(iterator)
-        if os.path.isdir(path):
-            import shutil
-            from filelock import FileLock
-            with FileLock("data.lock"):
-                shutil.rmtree(tmp_dir)
-        yield 0
-
-    return remove_func
 
 
 if __name__ == "__main__":
@@ -691,7 +603,7 @@ if __name__ == "__main__":
     # Cluster Initialization
     kwargs = {}
     if args.cluster_mode.startswith("yarn"):
-        kwargs["extra_python_lib"] = "qr_embedding_bag.py,md_embedding_bag.py,dlrm_data_pytorch_modified.py,data_utils.py"
+        kwargs["extra_python_lib"] = "qr_embedding_bag.py,md_embedding_bag.py,data_utils.py"
 
     sc = init_orca_context(cluster_mode=args.cluster_mode, cores=args.cores,
                            num_nodes=args.num_nodes, memory=args.memory, **kwargs)
@@ -728,7 +640,6 @@ if __name__ == "__main__":
         categorify = udf(lambda value: map_to_id(feature_dict_broadcast, value))
         df = df.withColumn(field, fillNA(col(field)))
         df = df.withColumn(field, categorify(col(field)))
-        # df = df.drop(field)
 
     for field in int_fields_name:
         df = df.withColumn(field, zeroThreshold(fillNA(col(field))))
@@ -746,11 +657,11 @@ if __name__ == "__main__":
     total = df.count()
     print(total)
 
-    # tmp path for preprocessed data on executors
-    tmp_dir = os.path.join("/tmp", str(uuid.uuid4()))
-    print("Saving data files on executor path: ", tmp_dir)
-    # TODO: remove files after training
-    df.rdd.mapPartitionsWithIndex(save(tmp_dir)).collect()
+    from zoo.orca.data import SparkXShards
+    rdd = df.rdd.map(lambda row: {"x": {"X_int": np.array([row[1]], dtype=np.int32),
+                                        "X_cat": np.array([row[2]], dtype=np.int32)},
+                                  "y": np.array([row[0]], dtype=np.int32)})
+    spark_xshards = SparkXShards(rdd)
 
     # Distributed training
     ### prepare training data ###
@@ -835,11 +746,27 @@ if __name__ == "__main__":
 
     ndevices = min(ngpus, args.mini_batch_size, num_fea - 1) if use_gpu else -1
 
+    def collate_wrapper_criteo(list_of_tuples):
+        # where each tuple is ({"X_int": ndarray, "X_cat": ndarray}, y)
+        # Or can change to list [ndarray, ndarray] for X_int and X_cat in order.
+        transposed_data = list(zip(*list_of_tuples))
+        X_int_list = [x["X_int"] for x in transposed_data[0]]
+        X_cat_list = [x["X_cat"] for x in transposed_data[0]]
+        X_int = torch.log(torch.tensor(X_int_list, dtype=torch.float) + 1)
+        X_cat = torch.tensor(X_cat_list, dtype=torch.long)
+        T = torch.tensor(transposed_data[1], dtype=torch.float32).view(-1, 1)
+
+        batchSize = X_cat.shape[0]
+        featureCnt = X_cat.shape[1]
+
+        lS_i = [X_cat[:, i] for i in range(featureCnt)]
+        lS_o = [torch.tensor(range(batchSize)) for _ in range(featureCnt)]
+
+        return X_int, torch.stack(lS_o), torch.stack(lS_i), T
+
     config = vars(args)
     config.update({"m_spa": m_spa, "ln_emb": ln_emb, "ln_bot": ln_bot, "ln_top": ln_top})
-    # mini_batch_size is the total batch size.
-    config["mini_batch_size"] = args.mini_batch_size // (args.workers_per_node * args.num_nodes)
-    config["executor_data_path"] = tmp_dir
+    config["collate_fn"] = collate_wrapper_criteo
 
     estimator = Estimator.from_torch(
         model=model_creator,
@@ -851,12 +778,12 @@ if __name__ == "__main__":
         use_tqdm=True,
         backend="pytorch")
 
-    stats = estimator.fit(train_data_creator, epochs=args.nepochs)
+    stats = estimator.fit(spark_xshards, epochs=args.nepochs,
+                          batch_size=args.mini_batch_size // (args.workers_per_node * args.num_nodes))
     print(stats)
-    val_stats = estimator.evaluate(test_data_creator)
-    print(val_stats)
+    # val_stats = estimator.evaluate(test_data_creator)
+    # print(val_stats)
 
     end_time = time.time()
     print("Time used: ", end_time - start_time)
-    sc.range(0, args.num_nodes, numSlices=args.num_nodes).mapPartitions(remove(tmp_dir)).collect()
     stop_orca_context()
