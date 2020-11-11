@@ -601,7 +601,7 @@ if __name__ == "__main__":
         print("Using CPU...")
 
     # Cluster Initialization
-    kwargs = {}
+    kwargs = {"object_store_memory": "20g"}
     if args.cluster_mode.startswith("yarn"):
         kwargs["extra_python_lib"] = "qr_embedding_bag.py,md_embedding_bag.py,data_utils.py"
 
