@@ -461,6 +461,31 @@ def scheduler_creator(optimizer, config):
     LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
                       config["lr_num_decay_steps"])
 
+def map_to_id(map_broadcast, category):
+    return map_broadcast.value[category]
+
+
+def preprocess(df):
+    fillNA = udf(lambda value: "0" if value == "" or value == "\n" or value is None else value)
+    zeroThreshold = udf(lambda value: 0 if int(value) < 0 else value)
+
+    for field in str_fields_name:
+        feature_dict_broadcast = sc.broadcast(feature_dict[field])
+        categorify = udf(lambda value: map_to_id(feature_dict_broadcast, value))
+        df = df.withColumn(field, fillNA(col(field)))
+        df = df.withColumn(field, categorify(col(field)))
+
+    for field in int_fields_name:
+        df = df.withColumn(field, zeroThreshold(fillNA(col(field))))
+
+    int_cols = [col(field) for field in int_fields_name]
+    str_cols = [col(field) for field in str_fields_name]
+    df = df.withColumn("X_int", array(int_cols))
+    df = df.withColumn("X_cat", array(str_cols))
+    df = df.select("y", "X_int", "X_cat")
+
+    return df
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -600,10 +625,16 @@ if __name__ == "__main__":
         device = torch.device("cpu")
         print("Using CPU...")
 
+    with open(args.driver_path + "train_fea_dict.pkl", 'rb') as f:
+        feature_dict = pickle.load(f)
+
     # Cluster Initialization
-    kwargs = {"object_store_memory": "20g"}
+    kwargs = {}
     if args.cluster_mode.startswith("yarn"):
-        kwargs["extra_python_lib"] = "qr_embedding_bag.py,md_embedding_bag.py,data_utils.py"
+        kwargs.update({"object_store_memory": "20g",
+                       "env": {"OMP_NUM_THREADS": str(args.cores),
+                               "KMP_AFFINITY": "granularity=fine,compact,1,0"},
+                       "extra_python_lib": "qr_embedding_bag.py,md_embedding_bag.py,data_utils.py"})
 
     sc = init_orca_context(cluster_mode=args.cluster_mode, cores=args.cores,
                            num_nodes=args.num_nodes, memory=args.memory, **kwargs)
@@ -621,47 +652,22 @@ if __name__ == "__main__":
     schema = StructType(label_fields + int_fields + str_fields)
     start_time = time.time()
     if args.hdfs_path:
-        df = spark.read.schema(schema).option("sep", "\t").csv(args.hdfs_path)
+        train_df = spark.read.schema(schema).option("sep", "\t").csv(args.hdfs_path + "kaggle_train.txt")
+        test_df = spark.read.schema(schema).option("sep", "\t").csv(args.hdfs_path + "kaggle_test.txt")
     else:
-        df = spark.read.schema(schema).option("sep", "\t").csv(args.driver_path + "train.txt")
+        train_df = spark.read.schema(schema).option("sep", "\t").csv(args.driver_path + "kaggle_train.txt")
+        test_df = spark.read.schema(schema).option("sep", "\t").csv(args.driver_path + "kaggle_test.txt")
 
-    with open(args.driver_path + "train_fea_dict.pkl", 'rb') as f:
-        feature_dict = pickle.load(f)
-
-    def map_to_id(map_broadcast, category):
-        return map_broadcast.value[category]
-
-    fillNA = udf(lambda value: "0" if value == "" or value == "\n" or value is None else value)
-    convertToInt = udf(lambda value: int(value, 16), IntegerType())
-    zeroThreshold = udf(lambda value: 0 if int(value) < 0 else value)
-
-    for field in str_fields_name:
-        feature_dict_broadcast = sc.broadcast(feature_dict[field])
-        categorify = udf(lambda value: map_to_id(feature_dict_broadcast, value))
-        df = df.withColumn(field, fillNA(col(field)))
-        df = df.withColumn(field, categorify(col(field)))
-
-    for field in int_fields_name:
-        df = df.withColumn(field, zeroThreshold(fillNA(col(field))))
-
-    df.show(5)
-
-    int_cols = [col(field) for field in int_fields_name]
-    str_cols = [col(field) for field in str_fields_name]
-    df = df.withColumn("X_int", array(int_cols))
-    df = df.withColumn("X_cat", array(str_cols))
-    df = df.select("y", "X_int", "X_cat")
-
-    df.show(5)
-
-    total = df.count()
-    print(total)
+    train_df = preprocess(train_df)
+    train_df.show(5)
+    # total = train_df.count()
+    # print(total)
 
     from zoo.orca.data import SparkXShards
-    rdd = df.rdd.map(lambda row: {"x": {"X_int": np.array([row[1]], dtype=np.int32),
-                                        "X_cat": np.array([row[2]], dtype=np.int32)},
-                                  "y": np.array([row[0]], dtype=np.int32)})
-    spark_xshards = SparkXShards(rdd)
+    train_rdd = train_df.rdd.map(lambda row: {"x": {"X_int": np.array([row[1]], dtype=np.int32),
+                                                    "X_cat": np.array([row[2]], dtype=np.int32)},
+                                              "y": np.array([row[0]], dtype=np.int32)})
+    train_xshards = SparkXShards(train_rdd)
 
     # Distributed training
     ### prepare training data ###
@@ -778,11 +784,17 @@ if __name__ == "__main__":
         use_tqdm=True,
         backend="pytorch")
 
-    stats = estimator.fit(spark_xshards, epochs=args.nepochs,
+    stats = estimator.fit(train_xshards, epochs=args.nepochs,
                           batch_size=args.mini_batch_size // (args.workers_per_node * args.num_nodes))
-    print(stats)
-    # val_stats = estimator.evaluate(test_data_creator)
-    # print(val_stats)
+    print("Train stats: ", stats)
+    test_df = preprocess(test_df)
+    test_rdd = test_df.rdd.map(lambda row: {"x": {"X_int": np.array([row[1]], dtype=np.int32),
+                                                  "X_cat": np.array([row[2]], dtype=np.int32)},
+                                            "y": np.array([row[0]], dtype=np.int32)})
+    test_xshards = SparkXShards(test_rdd)
+    val_stats = estimator.evaluate(test_xshards,
+                                   batch_size=args.test_mini_batch_size // (args.workers_per_node * args.num_nodes))
+    print("Test stats: ", val_stats)
 
     end_time = time.time()
     print("Time used: ", end_time - start_time)
