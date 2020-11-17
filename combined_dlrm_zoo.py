@@ -461,6 +461,7 @@ def scheduler_creator(optimizer, config):
     LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
                       config["lr_num_decay_steps"])
 
+
 def map_to_id(map_broadcast, category):
     return map_broadcast.value[category]
 
@@ -631,7 +632,7 @@ if __name__ == "__main__":
     # Cluster Initialization
     kwargs = {}
     if args.cluster_mode.startswith("yarn"):
-        kwargs.update({"object_store_memory": "20g",
+        kwargs.update({"object_store_memory": "20g", "driver_memory": "20g",
                        "env": {"OMP_NUM_THREADS": str(args.cores),
                                "KMP_AFFINITY": "granularity=fine,compact,1,0"},
                        "extra_python_lib": "qr_embedding_bag.py,md_embedding_bag.py,data_utils.py"})
@@ -795,6 +796,7 @@ if __name__ == "__main__":
     val_stats = estimator.evaluate(test_xshards,
                                    batch_size=args.test_mini_batch_size // (args.workers_per_node * args.num_nodes))
     print("Test stats: ", val_stats)
+    estimator.shutdown()
 
     end_time = time.time()
     print("Time used: ", end_time - start_time)
