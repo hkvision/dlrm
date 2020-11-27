@@ -786,7 +786,8 @@ if __name__ == "__main__":
         backend="pytorch")
 
     stats = estimator.fit(train_xshards, epochs=args.nepochs,
-                          batch_size=args.mini_batch_size // (args.workers_per_node * args.num_nodes))
+                          batch_size=args.mini_batch_size // (args.workers_per_node * args.num_nodes),
+                          reduce_results=False, profile=True)
     print("Train stats: ", stats)
     test_df = preprocess(test_df)
     test_rdd = test_df.rdd.map(lambda row: {"x": {"X_int": np.array([row[1]], dtype=np.int32),
