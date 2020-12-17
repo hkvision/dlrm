@@ -8,9 +8,9 @@ import numpy as np
 from pyspark.sql import SQLContext
 from pyspark.sql.types import *
 from pyspark.sql.functions import col, udf, array, rand, broadcast
+import pyarrow.plasma as plasma
 from zoo.orca import init_orca_context, stop_orca_context
 from zoo.orca.learn.pytorch import Estimator
-import pyarrow.plasma as plasma
 
 # miscellaneous
 import builtins
@@ -552,18 +552,25 @@ def data_creator(config, object_id_map):
     worker_object_ids = object_id_map[get_node_ip()]
     print("Number of files on this worker: ", len(worker_object_ids))
     client = plasma.connect(config["object_store_address"])
-    all_data = client.get(worker_object_ids)
-    X_int_list = []
-    X_cat_list = []
-    y_list = []
+    print("Connected to plasma")
+    all_objects = client.list()
+    print("Number of files in plasma: ", len(all_objects))
+    # all_data = client.get(worker_object_ids)
+    X_int = []
+    X_cat = []
+    y = []
     start = time.time()
-    for data in all_data:
-        X_int_list.append(np.array([x[1] for x in data], dtype=np.int32))  # continuous  feature
-        X_cat_list.append(np.array([x[2] for x in data], dtype=np.int32))  # categorical feature
-        y_list.append(np.array([x[0] for x in data], dtype=np.int32))  # target
-    X_int = np.concatenate(X_int_list)
-    X_cat = np.concatenate(X_cat_list)
-    y = np.concatenate(y_list)
+    for object_id in worker_object_ids:
+        assert object_id in all_objects
+        data = client.get(object_id)
+        print("Fetched ", object_id)
+        X_int.append(np.array([x[1] for x in data], dtype=np.int32))  # continuous  feature
+        X_cat.append(np.array([x[2] for x in data], dtype=np.int32))  # categorical feature
+        y.append(np.array([x[0] for x in data], dtype=np.int32))  # target
+    client.disconnect()
+    X_int = np.concatenate(X_int)
+    X_cat = np.concatenate(X_cat)
+    y = np.concatenate(y)
     x = {"X_int": X_int, "X_cat": X_cat}
     print("Data size on worker: ", len(y))
 
@@ -761,19 +768,24 @@ if __name__ == "__main__":
     # Cluster Initialization
     kwargs = {}
     if args.cluster_mode.startswith("yarn"):
-        kwargs.update({"object_store_memory": "80g", "driver_memory": "36g",
+        kwargs.update({"object_store_memory": "120g", "driver_memory": "36g",
                        "env": {"OMP_NUM_THREADS": str(args.cores),
                                "KMP_AFFINITY": "granularity=fine,compact,1,0"},
                        "extra_python_lib": "qr_embedding_bag.py,md_embedding_bag.py"})
 
     sc = init_orca_context(cluster_mode=args.cluster_mode, cores=args.cores,
                            num_nodes=args.num_nodes, memory=args.memory,
-                           conf={"spark.network.timeout": "10000000",
+                           conf={"spark.network.timeout": "1800s",
                                  "spark.sql.hive.filesourcePartitionFileCacheSize": "4096000000",
-                                 "spark.sql.broadcastTimeout": "14400", "spark.sql.shuffle.partitions": "4000",
+                                 "spark.sql.broadcastTimeout": "7200",
+                                 "spark.sql.shuffle.partitions": "2000",
+                                 "spark.sql.crossJoin.enabled": "true",
                                  "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
-                                 "spark.kryo.unsafe": "true", "spark.sql.adaptive.enabled": "true",
-                                 "spark.kryoserializer.buffer.max": "2047"},
+                                 "spark.kryo.unsafe": "true",
+                                 "spark.kryoserializer.buffer.max": "1024m",
+                                 "spark.task.cpus": "1",
+                                 "spark.driver.maxResultSize": "40G",
+                                 "spark.locality.wait": "0s"},
                            **kwargs)
 
     # Data preprocessing
@@ -790,9 +802,9 @@ if __name__ == "__main__":
     start_time = time.time()
     feature_map_dfs = list(load_column_models(spark, args.hdfs_path + "output/models/"))
     feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
-    # paths = [args.hdfs_path + 'day_%d' % i for i in list(range(0, 23))]
-    # train_df = spark.read.schema(schema).option("sep", "\t").csv(paths)
-    train_df = spark.read.schema(schema).option("sep", "\t").csv(args.hdfs_path + "day_0")
+    paths = [args.hdfs_path + 'day_%d' % i for i in list(range(0, 23))]
+    train_df = spark.read.schema(schema).option("sep", "\t").csv(paths)
+    # train_df = spark.read.schema(schema).option("sep", "\t").csv(args.hdfs_path + "day_0")
     print("Load count: ", train_df.count())
     print("Load partitions: ", train_df.rdd.getNumPartitions())
     train_df.show(5)
@@ -811,7 +823,7 @@ if __name__ == "__main__":
         def f(index, iterator):
             from zoo.util.utils import get_node_ip
             client = plasma.connect(address)
-            part_size = 1000000
+            part_size = 200000
             buffer = []
             current_object_ids = all_object_ids[index]
             for record in iterator:
@@ -843,7 +855,7 @@ if __name__ == "__main__":
 
     save_start = time.time()
     print("Saving train data files to plasma")
-    train_object_ids = [[plasma.ObjectID.from_random() for j in range(10)]
+    train_object_ids = [[plasma.ObjectID.from_random() for j in range(40)]
                         for i in range(train_rdd.getNumPartitions())]
 
     train_res = train_rdd.mapPartitionsWithIndex(
