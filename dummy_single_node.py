@@ -669,7 +669,7 @@ if __name__ == "__main__":
     records = []
     import random
     from torch.utils.data import Dataset, DataLoader
-    for i in range(1000):
+    for i in range(10000):
         label = random.randint(0, 1)
         int_features = [random.randint(0, 100) for i in range(13)]
         cat_features = []
