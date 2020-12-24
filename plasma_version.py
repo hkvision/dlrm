@@ -460,8 +460,8 @@ def optimizer_creator(model, config):
 
 
 def scheduler_creator(optimizer, config):
-    LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
-                      config["lr_num_decay_steps"])
+    return LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
+                             config["lr_num_decay_steps"])
 
 
 def map_to_id(map_broadcast, category):
@@ -1026,7 +1026,7 @@ if __name__ == "__main__":
     train_start = time.time()
     stats = estimator.fit(train_data_creator, epochs=args.nepochs,
                           batch_size=args.mini_batch_size // (args.workers_per_node * args.num_nodes),
-                          reduce_results=False)
+                          validation_data=test_data_creator, validation_steps=6400)
     print("Train stats: ", stats)
     train_end = time.time()
     print("Train time: ", train_end - train_start)
