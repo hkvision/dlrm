@@ -16,6 +16,10 @@ import torch.nn as nn
 from torch.nn.parallel.parallel_apply import parallel_apply
 from torch.nn.parallel.replicate import replicate
 from torch.nn.parallel.scatter_gather import gather, scatter
+
+import intel_pytorch_extension as ipex
+from intel_pytorch_extension import core
+
 # quotient-remainder trick
 from qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
@@ -60,6 +64,24 @@ class LRPolicyScheduler(_LRScheduler):
                 lr = self.base_lrs
         return lr
 
+
+class Cast(nn.Module):
+    __constants__ = ['to_dtype']
+
+    def __init__(self, to_dtype):
+        super(Cast, self).__init__()
+        self.to_dtype = to_dtype
+
+    def forward(self, input):
+        if input.is_mkldnn:
+            return input.to_dense(self.to_dtype)
+        else:
+            return input.to(self.to_dtype)
+
+    def extra_repr(self):
+        return 'to(%s)' % self.to_dtype
+
+
 ### define dlrm in PyTorch ###
 class DLRM_Net(nn.Module):
     def create_mlp(self, ln, sigmoid_layer):
@@ -70,7 +92,11 @@ class DLRM_Net(nn.Module):
             m = ln[i + 1]
 
             # construct fully connected operator
-            LL = nn.Linear(int(n), int(m), bias=True)
+            if self.use_ipex and self.bf16:
+                LL = ipex.IpexMLPLinear(int(n), int(m), bias=True, output_stays_blocked=(i < ln.size - 2),
+                                        default_blocking=32)
+            else:
+                LL = nn.Linear(int(n), int(m), bias=True)
 
             # initialize the weights
             # with torch.no_grad():
@@ -89,27 +115,48 @@ class DLRM_Net(nn.Module):
             # approach 3
             # LL.weight = Parameter(torch.tensor(W),requires_grad=True)
             # LL.bias = Parameter(torch.tensor(bt),requires_grad=True)
+
+            if self.bf16 and ipex.is_available():
+                LL.to(torch.bfloat16)
+            # prepack weight for IPEX Linear
+            if hasattr(LL, 'reset_weight_shape'):
+                LL.reset_weight_shape(block_for_dtype=torch.bfloat16)
+
             layers.append(LL)
 
             # construct sigmoid or relu operator
             if i == sigmoid_layer:
+                if self.bf16:
+                    layers.append(Cast(torch.float32))
                 layers.append(nn.Sigmoid())
             else:
-                layers.append(nn.ReLU())
+                if self.use_ipex and self.bf16:
+                    LL.set_activation_type('relu')
+                else:
+                    layers.append(nn.ReLU())
 
         # approach 1: use ModuleList
         # return layers
         # approach 2: use Sequential container to wrap all layers
         return torch.nn.Sequential(*layers)
 
-    def create_emb(self, m, ln):
+    def create_emb(self, m, ln, local_ln_emb_sparse=None, ln_emb_dense=None):
         emb_l = nn.ModuleList()
-        for i in range(0, ln.size):
+        # save the numpy random state
+        np_rand_state = np.random.get_state()
+        emb_dense = nn.ModuleList()
+        emb_sparse = nn.ModuleList()
+        embs = range(len(ln))
+        if local_ln_emb_sparse or ln_emb_dense:
+            embs = local_ln_emb_sparse + ln_emb_dense
+        for i in embs:
+            # Use per table random seed for Embedding initialization
+            np.random.seed(self.l_emb_seeds[i])
             n = ln[i]
             # construct embedding operator
             if self.qr_flag and n > self.qr_threshold:
                 EE = QREmbeddingBag(n, m, self.qr_collisions,
-                    operation=self.qr_operation, mode="sum", sparse=True)
+                                    operation=self.qr_operation, mode="sum", sparse=True)
             elif self.md_flag:
                 base = max(m)
                 _m = m[i] if n > self.md_threshold else base
@@ -121,52 +168,60 @@ class DLRM_Net(nn.Module):
                 EE.embs.weight.data = torch.tensor(W, requires_grad=True)
 
             else:
-                EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True)
-
                 # initialize embeddings
                 # nn.init.uniform_(EE.weight, a=-np.sqrt(1 / n), b=np.sqrt(1 / n))
                 W = np.random.uniform(
                     low=-np.sqrt(1 / n), high=np.sqrt(1 / n), size=(n, m)
                 ).astype(np.float32)
                 # approach 1
-                EE.weight.data = torch.tensor(W, requires_grad=True)
+                if n >= self.sparse_dense_boundary:
+                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=True, _weight=torch.tensor(W, requires_grad=True))
+                else:
+                    EE = nn.EmbeddingBag(n, m, mode="sum", sparse=False, _weight=torch.tensor(W, requires_grad=True))
                 # approach 2
                 # EE.weight.data.copy_(torch.tensor(W))
                 # approach 3
                 # EE.weight = Parameter(torch.tensor(W),requires_grad=True)
+                if self.bf16 and ipex.is_available():
+                    EE.to(torch.bfloat16)
 
             emb_l.append(EE)
 
-        return emb_l
+        # Restore the numpy random state
+        np.random.set_state(np_rand_state)
+        return emb_l, emb_dense, emb_sparse
 
     def __init__(
-        self,
-        m_spa=None,
-        ln_emb=None,
-        ln_bot=None,
-        ln_top=None,
-        arch_interaction_op=None,
-        arch_interaction_itself=False,
-        sigmoid_bot=-1,
-        sigmoid_top=-1,
-        sync_dense_params=True,
-        loss_threshold=0.0,
-        ndevices=-1,
-        qr_flag=False,
-        qr_operation="mult",
-        qr_collisions=0,
-        qr_threshold=200,
-        md_flag=False,
-        md_threshold=200,
+            self,
+            m_spa=None,
+            ln_emb=None,
+            ln_bot=None,
+            ln_top=None,
+            arch_interaction_op=None,
+            arch_interaction_itself=False,
+            sigmoid_bot=-1,
+            sigmoid_top=-1,
+            sync_dense_params=True,
+            loss_threshold=0.0,
+            ndevices=-1,
+            qr_flag=False,
+            qr_operation="mult",
+            qr_collisions=0,
+            qr_threshold=200,
+            md_flag=False,
+            md_threshold=200,
+            bf16=False,
+            use_ipex=False,
+            sparse_dense_boundary=2048
     ):
         super(DLRM_Net, self).__init__()
 
         if (
-            (m_spa is not None)
-            and (ln_emb is not None)
-            and (ln_bot is not None)
-            and (ln_top is not None)
-            and (arch_interaction_op is not None)
+                                (m_spa is not None)
+                            and (ln_emb is not None)
+                        and (ln_bot is not None)
+                    and (ln_top is not None)
+                and (arch_interaction_op is not None)
         ):
 
             # save arguments
@@ -178,6 +233,9 @@ class DLRM_Net(nn.Module):
             self.arch_interaction_itself = arch_interaction_itself
             self.sync_dense_params = sync_dense_params
             self.loss_threshold = loss_threshold
+            self.bf16 = bf16
+            self.use_ipex = use_ipex
+            self.sparse_dense_boundary = sparse_dense_boundary
             # create variables for QR embedding if applicable
             self.qr_flag = qr_flag
             if self.qr_flag:
@@ -188,9 +246,14 @@ class DLRM_Net(nn.Module):
             self.md_flag = md_flag
             if self.md_flag:
                 self.md_threshold = md_threshold
+
+            # generate np seeds for Emb table initialization
+            self.l_emb_seeds = np.random.randint(low=0, high=100000, size=len(ln_emb))
+
             # create operators
             if ndevices <= 1:
-                self.emb_l = self.create_emb(m_spa, ln_emb)
+                self.emb_l, _, _ = self.create_emb(m_spa, ln_emb)
+
             self.bot_l = self.create_mlp(ln_bot, sigmoid_bot)
             self.top_l = self.create_mlp(ln_top, sigmoid_top)
 
@@ -200,7 +263,13 @@ class DLRM_Net(nn.Module):
         #     x = layer(x)
         # return x
         # approach 2: use Sequential container to wrap all layers
-        return layers(x)
+        need_padding = self.use_ipex and self.bf16 and x.size(0) % 2 == 1
+        if need_padding:
+            x = torch.nn.functional.pad(input=x, pad=(0, 0, 0, 1), mode='constant', value=0)
+            ret = layers(x)
+            return (ret[:-1, :])
+        else:
+            return layers(x)
 
     def apply_emb(self, lS_o, lS_i, emb_l):
         # WARNING: notice that we are processing the batch at once. We implicitly
@@ -211,9 +280,7 @@ class DLRM_Net(nn.Module):
         # 3. for a list of embedding tables there is a list of batched lookups
 
         ly = []
-        # for k, sparse_index_group_batch in enumerate(lS_i):
-        for k in range(len(lS_i)):
-            sparse_index_group_batch = lS_i[k]
+        for k, sparse_index_group_batch in enumerate(lS_i):
             sparse_offset_group_batch = lS_o[k]
 
             # embedding lookup
@@ -229,27 +296,32 @@ class DLRM_Net(nn.Module):
         return ly
 
     def interact_features(self, x, ly):
+        x = x.to(ly[0].dtype)
         if self.arch_interaction_op == "dot":
-            # concatenate dense and sparse features
-            (batch_size, d) = x.shape
-            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
-            # perform a dot product
-            Z = torch.bmm(T, torch.transpose(T, 1, 2))
-            # append dense feature with the interactions (into a row vector)
-            # approach 1: all
-            # Zflat = Z.view((batch_size, -1))
-            # approach 2: unique
-            _, ni, nj = Z.shape
-            # approach 1: tril_indices
-            # offset = 0 if self.arch_interaction_itself else -1
-            # li, lj = torch.tril_indices(ni, nj, offset=offset)
-            # approach 2: custom
-            offset = 1 if self.arch_interaction_itself else 0
-            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
-            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
-            Zflat = Z[:, li, lj]
-            # concatenate dense features and interactions
-            R = torch.cat([x] + [Zflat], dim=1)
+            if self.bf16:
+                T = [x] + ly
+                R = ipex.interaction(*T)
+            else:
+                # concatenate dense and sparse features
+                (batch_size, d) = x.shape
+                T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+                # perform a dot product
+                Z = torch.bmm(T, torch.transpose(T, 1, 2))
+                # append dense feature with the interactions (into a row vector)
+                # approach 1: all
+                # Zflat = Z.view((batch_size, -1))
+                # approach 2: unique
+                _, ni, nj = Z.shape
+                # approach 1: tril_indices
+                # offset = 0 if self.arch_interaction_itself else -1
+                # li, lj = torch.tril_indices(ni, nj, offset=offset)
+                # approach 2: custom
+                offset = 1 if self.arch_interaction_itself else 0
+                li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+                lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+                Zflat = Z[:, li, lj]
+                # concatenate dense features and interactions
+                R = torch.cat([x] + [Zflat], dim=1)
         elif self.arch_interaction_op == "cat":
             # concatenation features (into a row vector)
             R = torch.cat([x] + ly, dim=1)
@@ -263,6 +335,8 @@ class DLRM_Net(nn.Module):
         return R
 
     def forward(self, dense_x, lS_o, lS_i):
+        if self.bf16:
+            dense_x = dense_x.bfloat16()
         if self.ndevices <= 1:
             return self.sequential_forward(dense_x, lS_o, lS_i)
         else:
@@ -445,7 +519,10 @@ def model_creator(config):
         qr_collisions=config["qr_collisions"],
         qr_threshold=config["qr_threshold"],
         md_flag=config["md_flag"],
-        md_threshold=config["md_threshold"])
+        md_threshold=config["md_threshold"],
+        sparse_dense_boundary=config["sparse_dense_boundary"],
+        bf16=config["bf16"],
+        use_ipex=config["use_ipex"])
     return dlrm
 
 
@@ -510,20 +587,17 @@ def test_data_creator(config):
 
 
 if __name__ == "__main__":
+    ### parse arguments ###
     parser = argparse.ArgumentParser(
         description="Train Deep Learning Recommendation Model (DLRM)"
     )
     # model related parameters
     parser.add_argument("--arch-sparse-feature-size", type=int, default=2)
-    parser.add_argument(
-        "--arch-embedding-size", type=dash_separated_ints, default="4-3-2")
+    parser.add_argument("--arch-embedding-size", type=str, default="4-3-2")
     # j will be replaced with the table number
-    parser.add_argument(
-        "--arch-mlp-bot", type=dash_separated_ints, default="4-3-2")
-    parser.add_argument(
-        "--arch-mlp-top", type=dash_separated_ints, default="4-2-1")
-    parser.add_argument(
-        "--arch-interaction-op", type=str, choices=['dot', 'cat'], default="dot")
+    parser.add_argument("--arch-mlp-bot", type=str, default="4-3-2")
+    parser.add_argument("--arch-mlp-top", type=str, default="4-2-1")
+    parser.add_argument("--arch-interaction-op", type=str, default="dot")
     parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
     # embedding table options
     parser.add_argument("--md-flag", action="store_true", default=False)
@@ -537,8 +611,7 @@ if __name__ == "__main__":
     # activations and loss
     parser.add_argument("--activation-function", type=str, default="relu")
     parser.add_argument("--loss-function", type=str, default="mse")  # or bce or wbce
-    parser.add_argument(
-        "--loss-weights", type=dash_separated_floats, default="1.0-1.0")  # for wbce
+    parser.add_argument("--loss-weights", type=str, default="1.0-1.0")  # for wbce
     parser.add_argument("--loss-threshold", type=float, default=0.0)  # 1.0e-7
     parser.add_argument("--round-targets", type=bool, default=False)
     # data
@@ -559,11 +632,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-indices-per-lookup-fixed", type=bool, default=False)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--memory-map", action="store_true", default=False)
-    parser.add_argument("--dataset-multiprocessing", action="store_true", default=False,
-                        help="The Kaggle dataset can be multiprocessed in an environment \
-                        with more than 7 CPU cores and more than 20 GB of memory. \n \
-                        The Terabyte dataset can be multiprocessed in an environment \
-                        with more than 24 CPU cores and at least 1 TB of memory.")
     # training
     parser.add_argument("--mini-batch-size", type=int, default=1)
     parser.add_argument("--nepochs", type=int, default=1)
@@ -601,6 +669,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr-num-warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-start-step", type=int, default=0)
     parser.add_argument("--lr-num-decay-steps", type=int, default=0)
+    # embedding table is sparse table only if sparse_dense_boundary >= 2048
+    parser.add_argument("--sparse-dense-boundary", type=int, default=2048)
+    # bf16 option
+    parser.add_argument("--bf16", action='store_true', default=False)
+    # ipex option
+    parser.add_argument("--use-ipex", action="store_true", default=False)
+
     parser.add_argument('--cluster_mode', type=str, default="local",
                         help='The mode for the Spark cluster.')
     parser.add_argument("--num_nodes", type=int, default=1,
@@ -633,12 +708,16 @@ if __name__ == "__main__":
         args.test_num_workers = args.num_workers
 
     use_gpu = args.use_gpu and torch.cuda.is_available()
+    use_ipex = args.use_ipex
     if use_gpu:
         torch.cuda.manual_seed_all(args.numpy_rand_seed)
         torch.backends.cudnn.deterministic = True
         device = torch.device("cuda", 0)
         ngpus = torch.cuda.device_count()  # 1
         print("Using {} GPU(s)...".format(ngpus))
+    elif use_ipex:
+        device = torch.device("dpcpp")
+        print("Using IPEX...")
     else:
         device = torch.device("cpu")
         print("Using CPU...")
@@ -651,7 +730,8 @@ if __name__ == "__main__":
     if args.cluster_mode.startswith("yarn"):
         kwargs.update({"object_store_memory": "20g", "driver_memory": "36g",
                        "env": {"OMP_NUM_THREADS": str(args.cores),
-                               "KMP_AFFINITY": "granularity=fine,compact,1,0"},
+                               "KMP_AFFINITY": "granularity=fine,compact,1,0",
+                               "KMP_BLOCKTIME": "1"},
                        "extra_python_lib": "qr_embedding_bag.py,md_embedding_bag.py"})
 
     sc = init_orca_context(cluster_mode=args.cluster_mode, cores=args.cores,
