@@ -1103,10 +1103,16 @@ if __name__ == "__main__":
                 '''
 
                 # forward pass
+                forward_start = time.time()
                 Z = dlrm_wrap(X, lS_o, lS_i, use_gpu, use_ipex, device)
+                forward_end = time.time()
+                print("Forward time: ", (forward_end - forward_start) * 1000)
 
                 # loss
+                loss_start = time.time()
                 E = loss_fn_wrap(Z, T, use_gpu, use_ipex, device)
+                loss_end = time.time()
+                print("Calculate loss time: ", (loss_end - loss_start) * 1000)
                 '''
                 # debug prints
                 print("output and loss")
@@ -1125,15 +1131,21 @@ if __name__ == "__main__":
                     # (where we do not accumulate gradients across mini-batches)
                     optimizer.zero_grad()
                     # backward pass
+                    backward_start = time.time()
                     E.backward()
+                    backward_end = time.time()
+                    print("Backward time: ", (backward_end - backward_start) * 1000)
                     # debug prints (check gradient norm)
                     # for l in mlp.layers:
                     #     if hasattr(l, 'weight'):
                     #          print(l.weight.grad.norm().item())
 
                     # optimizer
+                    optimize_start = time.time()
                     optimizer.step()
                     lr_scheduler.step()
+                    optimize_end = time.time()
+                    print("Optimize and scheduler time: ", (optimize_end - optimize_start) * 1000)
 
                 if args.mlperf_logging:
                     total_time += iteration_time

@@ -650,6 +650,8 @@ if __name__ == "__main__":
         md_flag=args.md_flag,
         md_threshold=args.md_threshold,
     )
+    # from torchsummary import summary
+    # summary(dlrm, input_size=[(13, ), (26, ), (26, )], device="cpu")
 
     # specify the loss function
     if args.loss_function == "mse":
