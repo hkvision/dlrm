@@ -52,6 +52,7 @@ class MPIEstimator:
         print(self.remote_hosts)
         self.dir = os.getcwd()
         self.workers_per_node = workers_per_node
+        config["workers_per_node"] = workers_per_node
         with open("saved_estimator.pkl", "wb") as f:
             cloudpickle.dump(
                 (model_creator, optimizer_creator, loss_creator, scheduler_creator, config), f)

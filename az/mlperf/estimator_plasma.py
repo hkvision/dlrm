@@ -98,6 +98,14 @@ import mlperf_logger
 
 from torch.optim.lr_scheduler import _LRScheduler
 
+import os
+import cloudpickle
+import pyarrow.plasma as plasma
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SQLContext
+from pyspark.sql.types import *
+from pyspark.sql.functions import col, udf, array, rand, broadcast
+
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
 
@@ -616,23 +624,119 @@ class DLRM_Net(nn.Module):
         return z0
 
 
-def data_creator(config, data_size):
-    import random
+def rand_ordinal(df):
+    # create a random long from the double precision float.
+    # The fraction part of a double is 52 bits, so we try to capture as much
+    # of that as possible
+    return df.withColumn('ordinal', col_of_rand_long())
+
+
+def col_of_rand_long():
+    return (rand() * (1 << 52)).cast(LongType())
+
+
+def load_column_models(spark, model_folder):
+    for i in list(range(14, 40)):
+        path = os.path.join(model_folder, '%d.parquet' % i)
+        df = spark.read.parquet(path)
+        yield i, df, would_broadcast(spark, path)
+
+
+def would_broadcast(spark, str_path):
+    sc = spark.sparkContext
+    config = sc._jsc.hadoopConfiguration()
+    path = sc._jvm.org.apache.hadoop.fs.Path(str_path)
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(config)
+    stat = fs.listFiles(path, True)
+    sum = 0
+    while stat.hasNext():
+       sum = sum + stat.next().getLen()
+    sql_conf = sc._jvm.org.apache.spark.sql.internal.SQLConf()
+    cutoff = sql_conf.autoBroadcastJoinThreshold() * sql_conf.fileCompressionFactor()
+    return sum <= cutoff
+
+
+def apply_models(df, models, broadcast_model=False):
+    # sort the models so broadcast joins come first. This is
+    # so we reduce the amount of shuffle data sooner than later
+    # If we parsed the string hex values to ints early on this would
+    # not make a difference.
+    from operator import itemgetter
+    models = sorted(models, key=itemgetter(2), reverse=True)
+    for i, model, would_broadcast in models:
+        col_name = '_c%d' % i
+        # broadcast joins can handle skewed data so no need to
+        # do anything special
+        model = (model.drop('model_count')
+                 .withColumnRenamed('data', col_name))
+        model = broadcast(model) if broadcast_model else model
+        df = (df
+              .join(model, col_name, how="left")
+              .drop(col_name)
+              .withColumnRenamed('id', col_name))
+    return df
+
+
+def preprocess_df(df, models, x_int_cols, x_cat_cols):
+    df = rand_ordinal(df)
+    df = apply_models(df, models, True)
+    df = df.fillna(0, x_int_cols + x_cat_cols)
+    zeroThreshold = udf(lambda value: 0 if int(value) < 0 else value)
+    for field in x_int_cols:
+        df = df.withColumn(field, zeroThreshold(col(field)))
+    print("data frame repartition")
+    df = df.repartition('ordinal').sortWithinPartitions('ordinal')
+    df = df.drop('ordinal')
+
+    int_cols = [col(field) for field in x_int_cols]
+    str_cols = [col(field) for field in x_cat_cols]
+    df = df.withColumn("X_int", array(int_cols))
+    df = df.withColumn("X_cat", array(str_cols))
+    df = df.select("y", "X_int", "X_cat")
+    return df
+
+
+def data_creator(config, object_id_map):
     from torch.utils.data import Dataset, DataLoader
-    records = []
-    for i in range(10000):
-        label = random.randint(0, 1)
-        int_features = [random.randint(0, 100) for i in range(13)]
-        cat_features = []
-        for i in range(26):
-            cat_features.append(random.randint(0, config["ln_emb"][i] -1))
-        records.append([label, int_features, cat_features])
-    records = records * data_size
-    X_int = np.array([x[1] for x in records], dtype=np.int32)
-    X_cat = np.array([x[2] for x in records], dtype=np.int32)
-    y = np.array([x[0] for x in records], dtype=np.int32)
+    import pyarrow.plasma as plasma
+    client = plasma.connect(config["object_store_address"])
+    print("Connected to plasma")
+    all_objects = object_id_map[get_node_ip()]
+    print("Number of partitions on this node: ", len(all_objects))
+    workers_per_node = config["workers_per_node"]
+
+    def chunks(lst, n):
+        """Yield successive n-sized chunks from lst."""
+        for i in range(0, len(lst), n):
+            yield lst[i:i + n]
+
+    worker_partition_ids = list(chunks(list(all_objects.keys()), len(all_objects) // workers_per_node))[config["rank"]]
+    worker_objects = []
+    for partition_id in worker_partition_ids:
+        worker_objects += all_objects[partition_id]
+    print("Number of partitions for this worker: ", len(worker_objects))
+    X_int = []
+    X_cat = []
+    y = []
+    start = time.time()
+    pickled_records = client.get(worker_objects, timeout_ms=0)
+    print("Data retrieved")
+    client.disconnect()
+    nested_records = [cloudpickle.loads(pickled_record) for pickled_record in pickled_records]
+    for data in nested_records:
+        print("---", len(data))
+        X_int.append(np.array([x[1] for x in data], dtype=np.int32))  # continuous  feature
+        X_cat.append(np.array([x[2] for x in data], dtype=np.int32))  # categorical feature
+        y.append(np.array([x[0] for x in data], dtype=np.int32))  # target
+
+    X_int = np.concatenate(X_int)
+    X_cat = np.concatenate(X_cat)
+    y = np.concatenate(y)
     x = {"X_int": X_int, "X_cat": X_cat}
     print("Data size on worker: ", len(y))
+    print("X_int: ", X_int.shape)
+    print("X_cat: ", X_cat.shape)
+    print("y: ", y.shape)
 
     class NDArrayDataset(Dataset):
         def __init__(self, x, y):
@@ -656,15 +760,17 @@ def data_creator(config, data_size):
         shuffle=True,
         collate_fn=config["collate_fn"],
     )
+    end = time.time()
+    print("Worker load data time: ", end - start)
     return loader
 
 
 def train_data_creator(config):
-    return data_creator(config, data_size=100)
+    return data_creator(config, config["train_data"])
 
 
 def test_data_creator(config):
-    return data_creator(config, data_size=10)
+    return data_creator(config, config["test_data"])
 
 
 def model_creator(config):
@@ -708,6 +814,33 @@ def optimizer_creator(model, config):
 def scheduler_creator(optimizer, config):
     return LRPolicyScheduler(optimizer, config["lr_num_warmup_steps"], config["lr_decay_start_step"],
                              config["lr_num_decay_steps"])
+
+
+def get_node_ip():
+    """
+    This function is ported from ray to get the ip of the current node. In the settings where
+    Ray is not involved, calling ray.services.get_node_ip_address would introduce Ray overhead.
+    """
+    import socket
+    import errno
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # This command will raise an exception if there is no internet connection.
+        s.connect(("8.8.8.8", 80))
+        node_ip_address = s.getsockname()[0]
+    except OSError as e:
+        node_ip_address = "127.0.0.1"
+        # [Errno 101] Network is unreachable
+        if e.errno == errno.ENETUNREACH:
+            try:
+                # try get node ip address from host name
+                host_name = socket.getfqdn(socket.gethostname())
+                node_ip_address = socket.gethostbyname(host_name)
+            except Exception:
+                pass
+    finally:
+        s.close()
+    return node_ip_address
 
 
 if __name__ == "__main__":
@@ -958,6 +1091,122 @@ if __name__ == "__main__":
     config["ndevices"] = ndevices
     config["collate_fn"] = collate_wrapper_criteo
 
+    conf = SparkConf().set("spark.driver.cores", "4") \
+        .set("spark.driver.memory", "20g") \
+        .set("spark.executor.instances", "2") \
+        .set("spark.executor.cores", "48") \
+        .set("spark.executor.memory", "80g") \
+        .set("spark.cores.max", "96") \
+        .set("spark.network.timeout", "1800s") \
+        .set("spark.sql.broadcastTimeout", "7200") \
+        .set("spark.sql.shuffle.partitions", "2000") \
+        .set("spark.locality.wait", "0s")
+    sc = SparkContext(master="spark://172.168.3.106:7077", conf=conf)
+    sqlContext = SQLContext.getOrCreate(sc)
+    spark = sqlContext.sparkSession
+
+    label_fields = [StructField("y", IntegerType())]
+    int_fields = [StructField("_c%d" % i, IntegerType()) for i in list(range(1, 14))]
+    str_fields = [StructField("_c%d" % i, StringType()) for i in list(range(14, 40))]
+    int_fields_name = [field.name for field in int_fields]
+    str_fields_name = [field.name for field in str_fields]
+    schema = StructType(label_fields + int_fields + str_fields)
+
+    data_path = "/var/backups/dlrm/terabyte/"
+    start_time = time.time()
+    feature_map_dfs = list(load_column_models(spark, data_path + "models/"))
+    feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
+    # paths = [args.hdfs_path + 'day_%d' % i for i in list(range(0, 23))]
+    # train_df = spark.read.schema(schema).option("sep", "\t").csv(paths)
+    train_df = spark.read.schema(schema).option("sep", "\t").csv(data_path + "day_0")
+    print("Load count: ", train_df.count())
+    print("Load partitions: ", train_df.rdd.getNumPartitions())
+    train_df.show(5)
+    train_df = preprocess_df(train_df, feature_map_dfs, int_fields_name, str_fields_name)
+    train_rdd = train_df.rdd
+    train_rdd = train_rdd.repartition(2 * 48)
+    train_rdd.cache()
+    count = train_rdd.count()
+    print("Processed train count: ", count)
+    print("Train partitions: ", train_rdd.getNumPartitions())
+    print(train_rdd.take(5))
+    preprocess_end = time.time()
+    print("Train data loading and preprocessing time: ", preprocess_end - start_time)
+    object_store_address = "/tmp/dlrm_plasma"
+    config["object_store_address"] = object_store_address
+
+    def put_to_plasma(all_object_ids, address):
+        def f(index, iterator):
+            client = plasma.connect(address)
+            part_size = 1000000
+            buffer = []
+            current_object_ids = all_object_ids[index]
+            for record in iterator:
+                if len(buffer) == part_size:
+                    target_id = current_object_ids.pop()
+                    object_id = client.put(cloudpickle.dumps(buffer), target_id)
+                    assert object_id == target_id, \
+                        "Errors occurred when putting data into plasma object store"
+                    buffer = [[record[0], record[1], record[2]]]
+                    yield index, part_size, target_id, get_node_ip()
+                else:
+                    buffer.append([record[0], record[1], record[2]])
+            remain_size = len(buffer)
+            if remain_size > 0:
+                target_id = current_object_ids.pop()
+                object_id = client.put(cloudpickle.dumps(buffer), target_id)
+                assert object_id == target_id, \
+                    "Errors occurred when putting data into plasma object store"
+                buffer = []
+                client.disconnect()
+                yield index, remain_size, target_id, get_node_ip()
+            else:
+                client.disconnect()
+        return f
+
+
+    def launch_plasma(iter):
+        import subprocess
+        p = subprocess.Popen(
+            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "15000000000", "-s", object_store_address])
+        time.sleep(2)  # Wait and make sure plasma has been started
+        yield 0
+
+    def shutdown_plasma(iter):
+        import subprocess
+        p = subprocess.Popen(["pkill", "plasma"])
+        os.waitpid(p.pid, 0)
+        yield 0
+
+    sc.range(0, 2, numSlices=2).barrier().mapPartitions(launch_plasma).collect()
+    train_object_ids = [[plasma.ObjectID.from_random() for j in range(20)]
+                        for i in range(train_rdd.getNumPartitions())]
+
+    train_res = train_rdd.mapPartitionsWithIndex(
+        put_to_plasma(train_object_ids, object_store_address)).collect()
+    train_data_map = {}
+    train_size_map = {}
+    for partition_id, subpartition_size, object_id, ip in train_res:
+        if ip not in train_data_map:
+            train_data_map[ip] = {}
+            train_size_map[ip] = {}
+        if partition_id not in train_data_map[ip]:
+            train_data_map[ip][partition_id] = []
+            train_size_map[ip][partition_id] = []
+        train_data_map[ip][partition_id].append(object_id)
+        train_size_map[ip][partition_id].append(subpartition_size)
+    size = 0
+    count = 0
+    for node, data in train_size_map.items():
+        for partition_id, subpartition_size in data.items():
+            size += sum(subpartition_size)
+            count += len(subpartition_size)
+        print("Node {} has {} subpartitions and {} train records".format(node, count, size))
+        size = 0
+        count = 0
+
+    config["train_data"] = train_data_map
+
     from mpi_estimator import MPIEstimator
     estimator = MPIEstimator(
         model_creator=model_creator,
@@ -974,3 +1223,6 @@ if __name__ == "__main__":
              "CCL_ATL_TRANSPORT": "ofi"})
     estimator.fit(train_data_creator, epochs=args.nepochs,
                   batch_size=args.mini_batch_size)
+
+    # Seems plasma would be always shutdown if the program exits.
+    sc.range(0, 2, numSlices=2).barrier().mapPartitions(shutdown_plasma).collect()
