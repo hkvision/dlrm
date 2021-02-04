@@ -45,7 +45,7 @@ class MPIEstimator:
         self.remote_hosts = []
         self.master = get_node_ip()
         print(self.master)
-        self.env = env
+        self.env = env if env else {}
         for host in hosts:
             if host != self.master:
                 self.remote_hosts.append(host)
@@ -65,16 +65,16 @@ class MPIEstimator:
                                   "root@{}:{}/".format(host, self.dir)])
             os.waitpid(p.pid, 0)
 
-    def fit(self, data_creator, epochs=1, batch_size=32):
+    def fit(self, data_creator, epochs=1, batch_size=32, validation_data_creator=None):
         with open("train_data.pkl", "wb") as f:
-            cloudpickle.dump((data_creator, epochs, batch_size), f)
+            cloudpickle.dump((data_creator, epochs, batch_size, validation_data_creator), f)
         for host in self.remote_hosts:
             p = subprocess.Popen(["scp", "train_data.pkl",
                                   "root@{}:{}/".format(host, self.dir)])
             os.waitpid(p.pid, 0)
         cmd = ['mpiexec.hydra']
         # TODO: make OMP_NUM_THREADS configurable
-        mpi_config = "-l -np {} -ppn {} -genv OMP_NUM_THREADS=20 ".format(
+        mpi_config = "-l -np {} -ppn {} -genv OMP_NUM_THREADS=24 ".format(
             self.workers_per_node * len(self.hosts),
             self.workers_per_node, ",".join(self.hosts))
         if len(self.remote_hosts) > 0:

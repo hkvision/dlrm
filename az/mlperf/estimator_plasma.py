@@ -692,15 +692,13 @@ def preprocess_df(df, models, x_int_cols, x_cat_cols):
     str_cols = [col(field) for field in x_cat_cols]
     df = df.withColumn("X_int", array(int_cols))
     df = df.withColumn("X_cat", array(str_cols))
-    df = df.select("y", "X_int", "X_cat")
+    df = df.select("_c0", "X_int", "X_cat")
     return df
 
 
 def data_creator(config, object_id_map):
     from torch.utils.data import Dataset, DataLoader
     import pyarrow.plasma as plasma
-    client = plasma.connect(config["object_store_address"])
-    print("Connected to plasma")
     all_objects = object_id_map[get_node_ip()]
     print("Number of partitions on this node: ", len(all_objects))
     workers_per_node = config["workers_per_node"]
@@ -711,57 +709,72 @@ def data_creator(config, object_id_map):
             yield lst[i:i + n]
 
     worker_partition_ids = list(chunks(list(all_objects.keys()), len(all_objects) // workers_per_node))[config["rank"]]
-    worker_objects = []
+    print(worker_partition_ids)
+    worker_object_ids = []
+    worker_subpartition_sizes = []
     for partition_id in worker_partition_ids:
-        worker_objects += all_objects[partition_id]
-    print("Number of partitions for this worker: ", len(worker_objects))
-    X_int = []
-    X_cat = []
-    y = []
-    start = time.time()
-    pickled_records = client.get(worker_objects, timeout_ms=0)
-    print("Data retrieved")
-    client.disconnect()
-    nested_records = [cloudpickle.loads(pickled_record) for pickled_record in pickled_records]
-    for data in nested_records:
-        print("---", len(data))
-        X_int.append(np.array([x[1] for x in data], dtype=np.int32))  # continuous  feature
-        X_cat.append(np.array([x[2] for x in data], dtype=np.int32))  # categorical feature
-        y.append(np.array([x[0] for x in data], dtype=np.int32))  # target
+        worker_data = all_objects[partition_id]
+        worker_object_ids += [x[0] for x in worker_data]
+        worker_subpartition_sizes += [x[1] for x in worker_data]
+    print("Number of subpartitions for this worker: ", len(worker_object_ids))
 
-    X_int = np.concatenate(X_int)
-    X_cat = np.concatenate(X_cat)
-    y = np.concatenate(y)
-    x = {"X_int": X_int, "X_cat": X_cat}
-    print("Data size on worker: ", len(y))
-    print("X_int: ", X_int.shape)
-    print("X_cat: ", X_cat.shape)
-    print("y: ", y.shape)
 
     class NDArrayDataset(Dataset):
-        def __init__(self, x, y):
-            self.x = x  # features
-            self.y = y  # labels
+        def __init__(self, object_ids, sizes, object_store_address):
+            self.client = plasma.connect(object_store_address)
+            print("Connected to plasma")
+            self.object_ids = object_ids
+            self.sizes = sizes
+            offsets = []
+            for i in sizes:
+                if len(offsets) == 0:
+                    offsets.append(i)
+                else:
+                    offsets.append(offsets[-1] + i)
+            self.offsets = offsets
+            self.current_index = 0
+            self.current_offset = self.offsets[self.current_index]
+            self.previous_offset = 0
+            self.current_x, self.current_y = self.load_subpartition(self.current_index)
+
+        def load_subpartition(self, index):
+            print("Loading partition {}".format(index))
+            current_data = self.client.get(self.object_ids[index], timeout_ms=0)
+            current_data = cloudpickle.loads(current_data)
+            X_int = np.concatenate([np.array([x[1]], dtype=np.int32) for x in current_data])
+            X_cat = np.concatenate([np.array([x[2]], dtype=np.int32) for x in current_data])
+            x = {"X_int": X_int, "X_cat": X_cat}
+            # print("X_int: ", X_int.shape)
+            # print("X_cat: ", X_cat.shape)
+            y = np.concatenate([np.array([x[0]], dtype=np.int32) for x in current_data])
+            print("y: ", y.shape)
+            if index == len(self.sizes)-1:
+                self.client.disconnect()
+            return x, y
 
         def __len__(self):
-            return len(self.y)
+            return sum(self.sizes)
 
         def __getitem__(self, i):
+            if i >= self.current_offset:
+                self.previous_offset = self.current_offset
+                self.current_index = self.current_index + 1
+                self.current_offset = self.offsets[self.current_index]
+                self.current_x, self.current_y = self.load_subpartition(self.current_index)
             x_i = {}
-            for k, v in self.x.items():
-                x_i[k] = v[i]
-            y_i = self.y[i]
+            for k, v in self.current_x.items():
+                x_i[k] = v[i - self.previous_offset]
+            y_i = self.current_y[i - self.previous_offset]
             return x_i, y_i
 
-    dataset = NDArrayDataset(x, y)
+    print("Data size on worker: ", sum(worker_subpartition_sizes))
+    dataset = NDArrayDataset(worker_object_ids, worker_subpartition_sizes, config["object_store_address"])
     loader = DataLoader(
         dataset,
         batch_size=config["batch_size"],
-        shuffle=True,
+        shuffle=False,  # Can't shuffle for this implementation. Spark preprocessing already does the shuffle.
         collate_fn=config["collate_fn"],
     )
-    end = time.time()
-    print("Worker load data time: ", end - start)
     return loader
 
 
@@ -1091,40 +1104,46 @@ if __name__ == "__main__":
     config["ndevices"] = ndevices
     config["collate_fn"] = collate_wrapper_criteo
 
+    executor_cores = 48
+    num_executors = 8
+
     conf = SparkConf().set("spark.driver.cores", "4") \
-        .set("spark.driver.memory", "20g") \
-        .set("spark.executor.instances", "2") \
-        .set("spark.executor.cores", "48") \
-        .set("spark.executor.memory", "80g") \
-        .set("spark.cores.max", "96") \
+        .set("spark.driver.memory", "32g") \
+        .set("spark.executor.instances", str(num_executors)) \
+        .set("spark.executor.cores", str(executor_cores)) \
+        .set("spark.executor.memory", "160g") \
+        .set("spark.cores.max", str(num_executors * executor_cores)) \
         .set("spark.network.timeout", "1800s") \
         .set("spark.sql.broadcastTimeout", "7200") \
         .set("spark.sql.shuffle.partitions", "2000") \
-        .set("spark.locality.wait", "0s")
+        .set("spark.locality.wait", "0s") \
+        .set("spark.sql.hive.filesourcePartitionFileCacheSize", "4096000000") \
+        .set("spark.sql.crossJoin.enabled", "true") \
+        .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .set("spark.kryo.unsafe", "true") \
+        .set("spark.kryoserializer.buffer.max", "1024m") \
+        .set("spark.task.cpus", "1") \
+        .set("spark.driver.maxResultSize", "40G")
     sc = SparkContext(master="spark://172.168.3.106:7077", conf=conf)
     sqlContext = SQLContext.getOrCreate(sc)
     spark = sqlContext.sparkSession
 
-    label_fields = [StructField("y", IntegerType())]
-    int_fields = [StructField("_c%d" % i, IntegerType()) for i in list(range(1, 14))]
-    str_fields = [StructField("_c%d" % i, StringType()) for i in list(range(14, 40))]
-    int_fields_name = [field.name for field in int_fields]
-    str_fields_name = [field.name for field in str_fields]
-    schema = StructType(label_fields + int_fields + str_fields)
+    int_fields_name = ["_c{}".format(i) for i in list(range(1, 14))]
+    str_fields_name = ["_c{}".format(i) for i in list(range(14, 40))]
 
     data_path = "/var/backups/dlrm/terabyte/"
     start_time = time.time()
     feature_map_dfs = list(load_column_models(spark, data_path + "models/"))
     feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
-    # paths = [args.hdfs_path + 'day_%d' % i for i in list(range(0, 23))]
-    # train_df = spark.read.schema(schema).option("sep", "\t").csv(paths)
-    train_df = spark.read.schema(schema).option("sep", "\t").csv(data_path + "day_0")
+    paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
+    train_df = spark.read.parquet(*paths)
+    # train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
     print("Load count: ", train_df.count())
     print("Load partitions: ", train_df.rdd.getNumPartitions())
     train_df.show(5)
     train_df = preprocess_df(train_df, feature_map_dfs, int_fields_name, str_fields_name)
     train_rdd = train_df.rdd
-    train_rdd = train_rdd.repartition(2 * 48)
+    train_rdd = train_rdd.repartition(num_executors * executor_cores)
     train_rdd.cache()
     count = train_rdd.count()
     print("Processed train count: ", count)
@@ -1168,7 +1187,7 @@ if __name__ == "__main__":
     def launch_plasma(iter):
         import subprocess
         p = subprocess.Popen(
-            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "15000000000", "-s", object_store_address])
+            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "150000000000", "-s", object_store_address])
         time.sleep(2)  # Wait and make sure plasma has been started
         yield 0
 
@@ -1178,12 +1197,17 @@ if __name__ == "__main__":
         os.waitpid(p.pid, 0)
         yield 0
 
-    sc.range(0, 2, numSlices=2).barrier().mapPartitions(launch_plasma).collect()
-    train_object_ids = [[plasma.ObjectID.from_random() for j in range(20)]
+    sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(launch_plasma).collect()
+    train_object_ids = [[plasma.ObjectID.from_random() for j in range(30)]
                         for i in range(train_rdd.getNumPartitions())]
 
+    save_start = time.time()
+    print("Saving train data files to plasma")
     train_res = train_rdd.mapPartitionsWithIndex(
         put_to_plasma(train_object_ids, object_store_address)).collect()
+    save_end = time.time()
+    print("Train data saving time: ", save_end - save_start)
+
     train_data_map = {}
     train_size_map = {}
     for partition_id, subpartition_size, object_id, ip in train_res:
@@ -1193,7 +1217,7 @@ if __name__ == "__main__":
         if partition_id not in train_data_map[ip]:
             train_data_map[ip][partition_id] = []
             train_size_map[ip][partition_id] = []
-        train_data_map[ip][partition_id].append(object_id)
+        train_data_map[ip][partition_id].append((object_id, subpartition_size))
         train_size_map[ip][partition_id].append(subpartition_size)
     size = 0
     count = 0
@@ -1205,7 +1229,52 @@ if __name__ == "__main__":
         size = 0
         count = 0
 
+    test_start = time.time()
+    test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
+    # test_df = spark.read.parquet(data_path + "parquet/sample_test_day_0.parquet")
+    print("Test load count: ", test_df.count())
+    test_df.show(5)
+    test_df = preprocess_df(test_df, feature_map_dfs, int_fields_name, str_fields_name)
+    test_rdd = test_df.rdd
+    test_rdd = test_rdd.repartition(num_executors * executor_cores)
+    test_rdd.cache()
+    count = test_rdd.count()
+    print("Processed test count: ", count)
+    print("Test partitions: ", test_rdd.getNumPartitions())
+    print(test_rdd.take(5))
+    test_preprocess_end = time.time()
+    print("Test data loading and preprocessing time: ", test_preprocess_end - test_start)
+
+    test_object_ids = [[plasma.ObjectID.from_random() for j in range(10)]
+                        for i in range(test_rdd.getNumPartitions())]
+    test_res = test_rdd.mapPartitionsWithIndex(
+        put_to_plasma(test_object_ids, object_store_address)).collect()
+    test_save_end = time.time()
+    print("Test data saving time: ", test_save_end - save_start)
+
+    test_data_map = {}
+    test_size_map = {}
+    for partition_id, subpartition_size, object_id, ip in test_res:
+        if ip not in test_data_map:
+            test_data_map[ip] = {}
+            test_size_map[ip] = {}
+        if partition_id not in test_data_map[ip]:
+            test_data_map[ip][partition_id] = []
+            test_size_map[ip][partition_id] = []
+            test_data_map[ip][partition_id].append((object_id, subpartition_size))
+        test_size_map[ip][partition_id].append(subpartition_size)
+    size = 0
+    count = 0
+    for node, data in test_size_map.items():
+        for partition_id, subpartition_size in data.items():
+            size += sum(subpartition_size)
+            count += len(subpartition_size)
+        print("Node {} has {} subpartitions and {} test records".format(node, count, size))
+        size = 0
+        count = 0
+
     config["train_data"] = train_data_map
+    config["test_data"] = test_data_map
 
     from mpi_estimator import MPIEstimator
     estimator = MPIEstimator(
@@ -1215,14 +1284,15 @@ if __name__ == "__main__":
         scheduler_creator=scheduler_creator,
         config=config,
         workers_per_node=2,
-        hosts=["172.168.3.106", "172.168.3.107"],
-        env={"KMP_BLOCKTIME": "1",
-             "KMP_AFFINITY": "granularity=fine,compact,1,0",
-             "CCL_WORKER_COUNT": "4",
-             "CCL_WORKER_AFFINITY": "0,1,2,3,24,25,26,27",
-             "CCL_ATL_TRANSPORT": "ofi"})
+        hosts=["172.168.3.106", "172.168.3.107", "172.168.3.108", "172.168.3.109", "172.168.3.110",
+               "172.168.3.111", "172.168.3.112", "172.168.3.113"])
+        # env={"KMP_BLOCKTIME": "1",
+        #      "KMP_AFFINITY": "granularity=fine,compact,1,0",
+        #      "CCL_WORKER_COUNT": "4",
+        #      "CCL_WORKER_AFFINITY": "0,1,2,3,24,25,26,27",
+        #      "CCL_ATL_TRANSPORT": "ofi"})
     estimator.fit(train_data_creator, epochs=args.nepochs,
-                  batch_size=args.mini_batch_size)
+                  batch_size=args.mini_batch_size, validation_data_creator=None)
 
     # Seems plasma would be always shutdown if the program exits.
-    sc.range(0, 2, numSlices=2).barrier().mapPartitions(shutdown_plasma).collect()
+    sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(shutdown_plasma).collect()
