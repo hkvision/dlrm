@@ -42,8 +42,9 @@ with open("saved_estimator.pkl", "rb") as f:
     model_creator, optimizer_creator, loss_creator, scheduler_creator, config = cloudpickle.load(f)
 
 with open("train_data.pkl", "rb") as f:
-    train_data_creator, epochs, batch_size, validation_data_creator = cloudpickle.load(f)
+    train_data_creator, epochs, batch_size, validation_data_creator, validate_batch_size = cloudpickle.load(f)
 config["batch_size"] = batch_size
+config["validate_batch_size"] = validate_batch_size
 config["rank"] = ext_dist.my_local_rank
 
 # # Don't wrap DDP on sparse embedding layers.
@@ -59,6 +60,11 @@ loss = loss_creator  # assume it is an instance
 scheduler = scheduler_creator(optimizer, config)
 train_ld = train_data_creator(config)
 nbatches = len(train_ld)
+train_batches = config["train_batches"]
+test_batches = config["test_batches"]
+print("Total train batches: ", nbatches)
+print("Batches to train: ", train_batches)
+print("Batches to test: ", test_batches)
 
 # 1 epoch first
 total_loss = 0
@@ -99,7 +105,7 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
         total_loss = 0
         total_samp = 0
 
-    if j == 200:  # Debug purpose only
+    if j + 1 == train_batches:  # Make sure all workers stop at the same time
         break
 
     should_test = ((j + 1) % config["test_freq"] == 0) or (j + 1 == nbatches)
@@ -121,13 +127,12 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
             # print("T_test: ", T_test.shape)
             scores.append(S_test)
             targets.append(T_test)
-            if i == 115:
+            if i + 1 == test_batches:
                 break
-        print("1111111111111")
         scores = np.concatenate(scores, axis=0)
         targets = np.concatenate(targets, axis=0)
-        print("Scores: ", scores.shape)
-        print("Targets: ", targets.shape)
+        # print("Scores: ", scores.shape)
+        # print("Targets: ", targets.shape)
         validation_results = {}
         metrics = {
             'loss': sklearn.metrics.log_loss,

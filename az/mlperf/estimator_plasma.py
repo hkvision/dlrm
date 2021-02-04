@@ -696,24 +696,15 @@ def preprocess_df(df, models, x_int_cols, x_cat_cols):
     return df
 
 
-def data_creator(config, object_id_map):
+def data_creator(config, worker_object_id_map, batch_size):
     from torch.utils.data import Dataset, DataLoader
     import pyarrow.plasma as plasma
-    all_objects = object_id_map[get_node_ip()]
-    print("Number of partitions on this node: ", len(all_objects))
-    workers_per_node = config["workers_per_node"]
+    worker_partitions = worker_object_id_map[get_node_ip()][config["rank"]]
+    print("Number of partitions for this worker: ", len(worker_partitions))
 
-    def chunks(lst, n):
-        """Yield successive n-sized chunks from lst."""
-        for i in range(0, len(lst), n):
-            yield lst[i:i + n]
-
-    worker_partition_ids = list(chunks(list(all_objects.keys()), len(all_objects) // workers_per_node))[config["rank"]]
-    print(worker_partition_ids)
     worker_object_ids = []
     worker_subpartition_sizes = []
-    for partition_id in worker_partition_ids:
-        worker_data = all_objects[partition_id]
+    for partition_id, worker_data in worker_partitions.items():
         worker_object_ids += [x[0] for x in worker_data]
         worker_subpartition_sizes += [x[1] for x in worker_data]
     print("Number of subpartitions for this worker: ", len(worker_object_ids))
@@ -738,7 +729,7 @@ def data_creator(config, object_id_map):
             self.current_x, self.current_y = self.load_subpartition(self.current_index)
 
         def load_subpartition(self, index):
-            print("Loading partition {}".format(index))
+            # print("Loading partition {}".format(index))
             current_data = self.client.get(self.object_ids[index], timeout_ms=0)
             current_data = cloudpickle.loads(current_data)
             X_int = np.concatenate([np.array([x[1]], dtype=np.int32) for x in current_data])
@@ -747,7 +738,7 @@ def data_creator(config, object_id_map):
             # print("X_int: ", X_int.shape)
             # print("X_cat: ", X_cat.shape)
             y = np.concatenate([np.array([x[0]], dtype=np.int32) for x in current_data])
-            print("y: ", y.shape)
+            # print("y: ", y.shape)
             if index == len(self.sizes)-1:
                 self.client.disconnect()
             return x, y
@@ -771,7 +762,7 @@ def data_creator(config, object_id_map):
     dataset = NDArrayDataset(worker_object_ids, worker_subpartition_sizes, config["object_store_address"])
     loader = DataLoader(
         dataset,
-        batch_size=config["batch_size"],
+        batch_size=batch_size,
         shuffle=False,  # Can't shuffle for this implementation. Spark preprocessing already does the shuffle.
         collate_fn=config["collate_fn"],
     )
@@ -779,11 +770,11 @@ def data_creator(config, object_id_map):
 
 
 def train_data_creator(config):
-    return data_creator(config, config["train_data"])
+    return data_creator(config, config["train_data"], config["batch_size"])
 
 
 def test_data_creator(config):
-    return data_creator(config, config["test_data"])
+    return data_creator(config, config["test_data"], config["validate_batch_size"])
 
 
 def model_creator(config):
@@ -854,6 +845,12 @@ def get_node_ip():
     finally:
         s.close()
     return node_ip_address
+
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
 if __name__ == "__main__":
@@ -1106,6 +1103,10 @@ if __name__ == "__main__":
 
     executor_cores = 48
     num_executors = 8
+    workers_per_node = 2
+    total_workers = num_executors * workers_per_node
+    train_batch_size = args.mini_batch_size // total_workers
+    test_batch_size = args.test_mini_batch_size // total_workers
 
     conf = SparkConf().set("spark.driver.cores", "4") \
         .set("spark.driver.memory", "32g") \
@@ -1187,9 +1188,9 @@ if __name__ == "__main__":
     def launch_plasma(iter):
         import subprocess
         p = subprocess.Popen(
-            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "150000000000", "-s", object_store_address])
+            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "200000000000", "-s", object_store_address])
         time.sleep(2)  # Wait and make sure plasma has been started
-        yield 0
+        yield get_node_ip()
 
     def shutdown_plasma(iter):
         import subprocess
@@ -1197,7 +1198,8 @@ if __name__ == "__main__":
         os.waitpid(p.pid, 0)
         yield 0
 
-    sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(launch_plasma).collect()
+    ips = sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(launch_plasma).collect()
+    print(ips)
     train_object_ids = [[plasma.ObjectID.from_random() for j in range(30)]
                         for i in range(train_rdd.getNumPartitions())]
 
@@ -1228,6 +1230,25 @@ if __name__ == "__main__":
         print("Node {} has {} subpartitions and {} train records".format(node, count, size))
         size = 0
         count = 0
+
+    train_data_assignment = {}
+    train_data_sizes = []
+    for ip, partitions in train_data_map.items():
+        train_data_assignment[ip] = {}
+        worker_partition_ids = list(chunks(list(partitions.keys()), len(partitions) // workers_per_node))
+        for i in range(workers_per_node):
+            train_data_assignment[ip][i] = {}
+            worker_data_size = 0
+            worker_partitions = worker_partition_ids[i]
+            for partition_id in worker_partitions:
+                worker_data = partitions[partition_id]
+                train_data_assignment[ip][i][partition_id] = worker_data
+                worker_data_size += sum([size for object_id, size in worker_data])
+            train_data_sizes.append(worker_data_size)
+    print(train_data_sizes)
+    for ip, workers in train_data_assignment.items():
+        for worker_id, worker_data in workers.items():
+            print("Worker {} on node {} has {} train partitions".format(worker_id, ip, len(worker_data)))
 
     test_start = time.time()
     test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
@@ -1273,8 +1294,30 @@ if __name__ == "__main__":
         size = 0
         count = 0
 
-    config["train_data"] = train_data_map
-    config["test_data"] = test_data_map
+    test_data_assignment = {}
+    test_data_sizes = []
+    for ip, partitions in test_data_map.items():
+        test_data_assignment[ip] = {}
+        worker_partition_ids = list(chunks(list(partitions.keys()), len(partitions) // workers_per_node))
+        for i in range(workers_per_node):
+            test_data_assignment[ip][i] = {}
+            worker_data_size = 0
+            worker_partitions = worker_partition_ids[i]
+            for partition_id in worker_partitions:
+                worker_data = partitions[partition_id]
+                test_data_assignment[ip][i][partition_id] = worker_data
+                worker_data_size += sum([size for object_id, size in worker_data])
+            test_data_sizes.append(worker_data_size)
+    print(test_data_sizes)
+    for ip, workers in test_data_assignment.items():
+        for worker_id, worker_data in workers.items():
+            print("Worker {} on node {} has {} test partitions".format(worker_id, ip, len(worker_data)))
+
+    config["train_data"] = train_data_assignment
+    # Make sure all workers stop at the same time, i.e. when the worker with the fewest data finishes
+    config["train_batches"] = min(train_data_sizes) // train_batch_size
+    config["test_data"] = test_data_assignment
+    config["test_batches"] = min(test_data_sizes) // test_batch_size
 
     from mpi_estimator import MPIEstimator
     estimator = MPIEstimator(
@@ -1284,15 +1327,14 @@ if __name__ == "__main__":
         scheduler_creator=scheduler_creator,
         config=config,
         workers_per_node=2,
-        hosts=["172.168.3.106", "172.168.3.107", "172.168.3.108", "172.168.3.109", "172.168.3.110",
-               "172.168.3.111", "172.168.3.112", "172.168.3.113"])
+        hosts=ips)
         # env={"KMP_BLOCKTIME": "1",
         #      "KMP_AFFINITY": "granularity=fine,compact,1,0",
         #      "CCL_WORKER_COUNT": "4",
         #      "CCL_WORKER_AFFINITY": "0,1,2,3,24,25,26,27",
         #      "CCL_ATL_TRANSPORT": "ofi"})
-    estimator.fit(train_data_creator, epochs=args.nepochs,
-                  batch_size=args.mini_batch_size, validation_data_creator=None)
+    estimator.fit(train_data_creator, epochs=args.nepochs, batch_size=train_batch_size,
+                  validation_data_creator=test_data_creator, validate_batch_size=test_batch_size)
 
     # Seems plasma would be always shutdown if the program exits.
     sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(shutdown_plasma).collect()
