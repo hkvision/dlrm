@@ -1139,9 +1139,9 @@ if __name__ == "__main__":
     start_time = time.time()
     feature_map_dfs = list(load_column_models(spark, data_path + "models/"))
     feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
-    # paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
-    # train_df = spark.read.parquet(*paths)
-    train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
+    paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
+    train_df = spark.read.parquet(*paths)
+    # train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
     print("Load count: ", train_df.count())
     print("Load partitions: ", train_df.rdd.getNumPartitions())
     train_df.show(5)
@@ -1191,7 +1191,7 @@ if __name__ == "__main__":
     def launch_plasma(iter):
         import subprocess
         p = subprocess.Popen(
-            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "180000000000", "-s", object_store_address])
+            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "100000000000", "-s", object_store_address])
         time.sleep(2)  # Wait and make sure plasma has been started
         yield get_node_ip()
 
@@ -1254,8 +1254,8 @@ if __name__ == "__main__":
             print("Worker {} on node {} has {} train partitions".format(worker_id, ip, len(worker_data)))
 
     test_start = time.time()
-    # test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
-    test_df = spark.read.parquet(data_path + "parquet/sample_day_23_test.parquet")
+    test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
+    # test_df = spark.read.parquet(data_path + "parquet/sample_day_23_test.parquet")
     print("Test load count: ", test_df.count())
     test_df.show(5)
     test_df = preprocess_df(test_df, feature_map_dfs, int_fields_name, str_fields_name)
@@ -1336,8 +1336,11 @@ if __name__ == "__main__":
         #      "CCL_WORKER_COUNT": "4",
         #      "CCL_WORKER_AFFINITY": "0,1,2,3,24,25,26,27",
         #      "CCL_ATL_TRANSPORT": "ofi"})
+    fit_start = time.time()
     estimator.fit(train_data_creator, epochs=args.nepochs, batch_size=train_batch_size,
                   validation_data_creator=test_data_creator, validate_batch_size=test_batch_size)
+    fit_end = time.time()
+    print("Train and test time: ", fit_end - fit_start)
 
     # Seems plasma would be always shutdown if the program exits.
     sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(shutdown_plasma).collect()
