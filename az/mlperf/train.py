@@ -30,9 +30,8 @@ def get_node_ip():
         s.close()
     return node_ip_address
 
-print("Initializing distributed environment")
+print("Initializing distributed environment on ", get_node_ip())
 ext_dist.init_distributed(backend="ccl")
-print(get_node_ip())
 print("Rank: ", ext_dist.my_rank)
 print("Local rank: ", ext_dist.my_local_rank)
 print("Size: ", ext_dist.my_size)
@@ -105,10 +104,7 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
         total_loss = 0
         total_samp = 0
 
-    if j + 1 == train_batches:  # Make sure all workers stop at the same time
-        break
-
-    should_test = ((j + 1) % config["test_freq"] == 0) or (j + 1 == nbatches)
+    should_test = ((j + 1) % config["test_freq"] == 0) or (j + 1 == train_batches)
     if should_test and validation_data_creator:
         valid_ld = validation_data_creator(config)
         print("Test size: ", len(valid_ld))
@@ -154,3 +150,6 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
             + " auc {:.4f}".format(validation_results['roc_auc'])
             + " accuracy {:3.3f} %".format(validation_results['accuracy'] * 100)
         )
+
+    if j + 1 == train_batches:  # Make sure all workers stop at the same time
+        break

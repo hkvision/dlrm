@@ -894,6 +894,7 @@ if __name__ == "__main__":
     # data
     parser.add_argument("--data-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=0)
+    parser.add_argument("--num-test-batches", type=int, default=0)
     parser.add_argument(
         "--data-generation", type=str, default="random"
     )  # synthetic or dataset
@@ -954,6 +955,7 @@ if __name__ == "__main__":
     parser.add_argument("--bf16", action='store_true', default=False)
     # ipex option
     parser.add_argument("--use-ipex", action="store_true", default=False)
+    parser.add_argument("--num-nodes", type=int, default=2)
 
     args = parser.parse_args()
 
@@ -1102,19 +1104,19 @@ if __name__ == "__main__":
     config["collate_fn"] = collate_wrapper_criteo
 
     executor_cores = 48
-    num_executors = 8
+    num_executors = args.num_nodes
     workers_per_node = 2
     total_workers = num_executors * workers_per_node
     train_batch_size = args.mini_batch_size // total_workers
     test_batch_size = args.test_mini_batch_size // total_workers
 
     conf = SparkConf().set("spark.driver.cores", "4") \
-        .set("spark.driver.memory", "32g") \
+        .set("spark.driver.memory", "36g") \
         .set("spark.executor.instances", str(num_executors)) \
         .set("spark.executor.cores", str(executor_cores)) \
         .set("spark.executor.memory", "160g") \
         .set("spark.cores.max", str(num_executors * executor_cores)) \
-        .set("spark.network.timeout", "1800s") \
+        .set("spark.network.timeout", "10000000") \
         .set("spark.sql.broadcastTimeout", "7200") \
         .set("spark.sql.shuffle.partitions", "2000") \
         .set("spark.locality.wait", "0s") \
@@ -1124,6 +1126,7 @@ if __name__ == "__main__":
         .set("spark.kryo.unsafe", "true") \
         .set("spark.kryoserializer.buffer.max", "1024m") \
         .set("spark.task.cpus", "1") \
+        .set("spark.executor.heartbeatInterval", "200s") \
         .set("spark.driver.maxResultSize", "40G")
     sc = SparkContext(master="spark://172.168.3.106:7077", conf=conf)
     sqlContext = SQLContext.getOrCreate(sc)
@@ -1136,9 +1139,9 @@ if __name__ == "__main__":
     start_time = time.time()
     feature_map_dfs = list(load_column_models(spark, data_path + "models/"))
     feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
-    paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
-    train_df = spark.read.parquet(*paths)
-    # train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
+    # paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
+    # train_df = spark.read.parquet(*paths)
+    train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
     print("Load count: ", train_df.count())
     print("Load partitions: ", train_df.rdd.getNumPartitions())
     train_df.show(5)
@@ -1188,7 +1191,7 @@ if __name__ == "__main__":
     def launch_plasma(iter):
         import subprocess
         p = subprocess.Popen(
-            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "200000000000", "-s", object_store_address])
+            ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "180000000000", "-s", object_store_address])
         time.sleep(2)  # Wait and make sure plasma has been started
         yield get_node_ip()
 
@@ -1251,8 +1254,8 @@ if __name__ == "__main__":
             print("Worker {} on node {} has {} train partitions".format(worker_id, ip, len(worker_data)))
 
     test_start = time.time()
-    test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
-    # test_df = spark.read.parquet(data_path + "parquet/sample_test_day_0.parquet")
+    # test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
+    test_df = spark.read.parquet(data_path + "parquet/sample_day_23_test.parquet")
     print("Test load count: ", test_df.count())
     test_df.show(5)
     test_df = preprocess_df(test_df, feature_map_dfs, int_fields_name, str_fields_name)
@@ -1315,9 +1318,9 @@ if __name__ == "__main__":
 
     config["train_data"] = train_data_assignment
     # Make sure all workers stop at the same time, i.e. when the worker with the fewest data finishes
-    config["train_batches"] = min(train_data_sizes) // train_batch_size
+    config["train_batches"] = args.num_batches if args.num_batches > 0 else min(train_data_sizes) // train_batch_size
     config["test_data"] = test_data_assignment
-    config["test_batches"] = min(test_data_sizes) // test_batch_size
+    config["test_batches"] = args.num_test_batches if args.num_test_batches > 0 else min(test_data_sizes) // test_batch_size
 
     from mpi_estimator import MPIEstimator
     estimator = MPIEstimator(
@@ -1326,7 +1329,7 @@ if __name__ == "__main__":
         loss_creator=torch.nn.BCELoss(),
         scheduler_creator=scheduler_creator,
         config=config,
-        workers_per_node=2,
+        workers_per_node=workers_per_node,
         hosts=ips)
         # env={"KMP_BLOCKTIME": "1",
         #      "KMP_AFFINITY": "granularity=fine,compact,1,0",

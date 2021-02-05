@@ -41,7 +41,6 @@ class MPIEstimator:
                  hosts=None,
                  workers_per_node=1,
                  env=None):
-        self.hosts = hosts
         self.remote_hosts = []
         driver_ip = get_node_ip()
         self.master = driver_ip if driver_ip in hosts else hosts[0]
@@ -50,14 +49,20 @@ class MPIEstimator:
         for host in hosts:
             if host != driver_ip:
                 self.remote_hosts.append(host)
+        # master should be put at the very beginning; otherwise init_process_group would crash.
+        if self.master in self.remote_hosts:
+            self.hosts = self.remote_hosts
+        else:
+            self.hosts = [self.master] + self.remote_hosts
         print("Remote hosts: ", self.remote_hosts)
+        print("Hosts: ", self.hosts)
         self.dir = os.getcwd()
         self.workers_per_node = workers_per_node
         config["workers_per_node"] = workers_per_node
         with open("saved_estimator.pkl", "wb") as f:
             cloudpickle.dump(
                 (model_creator, optimizer_creator, loss_creator, scheduler_creator, config), f)
-        # Assumption: all hosts can ssh each other without password; all hosts have the same working directory.
+        # Assumption: driver can ssh workers without password; all workers have the same working directory.
         for host in self.remote_hosts:
             p = subprocess.Popen(["scp", "saved_estimator.pkl",
                                   "root@{}:{}/".format(host, self.dir)])
@@ -77,7 +82,7 @@ class MPIEstimator:
         # TODO: make OMP_NUM_THREADS configurable
         mpi_config = "-l -np {} -ppn {} -genv OMP_NUM_THREADS=20 ".format(
             self.workers_per_node * len(self.hosts),
-            self.workers_per_node, ",".join(self.hosts))
+            self.workers_per_node)
         if len(self.remote_hosts) > 0:
             mpi_config += "-hosts {}".format(",".join(self.hosts))
         cmd.extend(mpi_config.split())
@@ -85,7 +90,7 @@ class MPIEstimator:
         cmd.append(sys.executable)
         cmd.append("-u")  # This can print as the program runs
         cmd.append("train.py")
-        # print(cmd)
+        print(cmd)
         mpi_env = os.environ.copy()
         mpi_env.update(self.env)
         mpi_env["MASTER_ADDR"] = str(self.master)
