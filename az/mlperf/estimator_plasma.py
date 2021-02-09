@@ -69,7 +69,6 @@ import warnings
 
 with warnings.catch_warnings():
     warnings.filterwarnings("ignore", category=DeprecationWarning)
-import onnx
 
 # pytorch
 import torch
@@ -89,7 +88,6 @@ from tricks.qr_embedding_bag import QREmbeddingBag
 # mixed-dimension trick
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 
-import sklearn.metrics
 import mlperf_logger
 
 # from torchviz import make_dot
@@ -99,7 +97,6 @@ import mlperf_logger
 from torch.optim.lr_scheduler import _LRScheduler
 
 import os
-import cloudpickle
 import pyarrow.plasma as plasma
 from pyspark import SparkContext, SparkConf
 from pyspark.sql import SQLContext
@@ -730,14 +727,12 @@ def data_creator(config, worker_object_id_map, batch_size):
 
         def load_subpartition(self, index):
             # print("Loading partition {}".format(index))
+            # {"X_int": .., "X_cat": ..., "y": ...}
             current_data = self.client.get(self.object_ids[index], timeout_ms=0)
-            current_data = cloudpickle.loads(current_data)
-            X_int = np.concatenate([np.array([x[1]], dtype=np.int32) for x in current_data])
-            X_cat = np.concatenate([np.array([x[2]], dtype=np.int32) for x in current_data])
-            x = {"X_int": X_int, "X_cat": X_cat}
-            # print("X_int: ", X_int.shape)
-            # print("X_cat: ", X_cat.shape)
-            y = np.concatenate([np.array([x[0]], dtype=np.int32) for x in current_data])
+            y = current_data.pop("y")
+            x = current_data
+            # print("X_int: ", x["X_int"].shape)
+            # print("X_cat: ", x["X_cat"].shape)
             # print("y: ", y.shape)
             if index == len(self.sizes)-1:
                 self.client.disconnect()
@@ -1136,10 +1131,11 @@ if __name__ == "__main__":
     str_fields_name = ["_c{}".format(i) for i in list(range(14, 40))]
 
     data_path = "/var/backups/dlrm/terabyte/"
-    start_time = time.time()
     feature_map_dfs = list(load_column_models(spark, data_path + "models/"))
     feature_map_dfs = [(i, df, flag) for i, df, flag in feature_map_dfs]
     paths = [data_path + 'parquet/day_{}.parquet'.format(i) for i in list(range(0, 23))]
+
+    preprocess_start = time.time()
     train_df = spark.read.parquet(*paths)
     # train_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
     print("Load count: ", train_df.count())
@@ -1154,7 +1150,7 @@ if __name__ == "__main__":
     print("Train partitions: ", train_rdd.getNumPartitions())
     print(train_rdd.take(5))
     preprocess_end = time.time()
-    print("Train data loading and preprocessing time: ", preprocess_end - start_time)
+    print("Train data loading and preprocessing time: ", preprocess_end - preprocess_start)
     object_store_address = "/tmp/dlrm_plasma"
     config["object_store_address"] = object_store_address
 
@@ -1166,8 +1162,12 @@ if __name__ == "__main__":
             current_object_ids = all_object_ids[index]
             for record in iterator:
                 if len(buffer) == part_size:
+                    X_int_buffer = np.array([record[1] for record in buffer], dtype=np.int32)
+                    X_cat_buffer = np.array([record[2] for record in buffer], dtype=np.int32)
+                    y_buffer = np.array([record[0] for record in buffer], dtype=np.int32)
+                    res_buffer = {"X_int": X_int_buffer, "X_cat": X_cat_buffer, "y": y_buffer}
                     target_id = current_object_ids.pop()
-                    object_id = client.put(cloudpickle.dumps(buffer), target_id)
+                    object_id = client.put(res_buffer, target_id)
                     assert object_id == target_id, \
                         "Errors occurred when putting data into plasma object store"
                     buffer = [[record[0], record[1], record[2]]]
@@ -1176,8 +1176,12 @@ if __name__ == "__main__":
                     buffer.append([record[0], record[1], record[2]])
             remain_size = len(buffer)
             if remain_size > 0:
+                X_int_buffer = np.array([record[1] for record in buffer], dtype=np.int32)
+                X_cat_buffer = np.array([record[2] for record in buffer], dtype=np.int32)
+                y_buffer = np.array([record[0] for record in buffer], dtype=np.int32)
+                res_buffer = {"X_int": X_int_buffer, "X_cat": X_cat_buffer, "y": y_buffer}
                 target_id = current_object_ids.pop()
-                object_id = client.put(cloudpickle.dumps(buffer), target_id)
+                object_id = client.put(res_buffer, target_id)
                 assert object_id == target_id, \
                     "Errors occurred when putting data into plasma object store"
                 buffer = []
@@ -1195,14 +1199,30 @@ if __name__ == "__main__":
         time.sleep(2)  # Wait and make sure plasma has been started
         yield get_node_ip()
 
+
+    def get_ip(iter):
+        yield get_node_ip()
+
+
     def shutdown_plasma(iter):
         import subprocess
         p = subprocess.Popen(["pkill", "plasma"])
         os.waitpid(p.pid, 0)
         yield 0
 
-    ips = sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(launch_plasma).collect()
+    ips = sc.range(0, num_executors, numSlices=num_executors).barrier().mapPartitions(get_ip).collect()
     print(ips)
+    import subprocess
+    for ip in ips:
+        if ip != get_node_ip():
+            p = subprocess.Popen(["ssh", "root@{}".format(ip),
+                                  "/opt/work/anaconda3/envs/dlrm/bin/plasma_store -m 100000000000 -s {}".format(object_store_address)])
+        else:
+            p = subprocess.Popen(
+                ["/opt/work/anaconda3/envs/dlrm/bin/plasma_store", "-m", "100000000000", "-s", object_store_address])
+        print("Plasma launched on {}".format(ip))
+        time.sleep(2)
+
     train_object_ids = [[plasma.ObjectID.from_random() for j in range(30)]
                         for i in range(train_rdd.getNumPartitions())]
 
@@ -1212,6 +1232,7 @@ if __name__ == "__main__":
         put_to_plasma(train_object_ids, object_store_address)).collect()
     save_end = time.time()
     print("Train data saving time: ", save_end - save_start)
+    train_rdd.unpersist()
 
     train_data_map = {}
     train_size_map = {}
@@ -1255,7 +1276,7 @@ if __name__ == "__main__":
 
     test_start = time.time()
     test_df = spark.read.parquet(data_path + "parquet/day_23_test.parquet")
-    # test_df = spark.read.parquet(data_path + "parquet/sample_day_23_test.parquet")
+    # test_df = spark.read.parquet(data_path + "parquet/sample_day_0.parquet")
     print("Test load count: ", test_df.count())
     test_df.show(5)
     test_df = preprocess_df(test_df, feature_map_dfs, int_fields_name, str_fields_name)
@@ -1269,12 +1290,16 @@ if __name__ == "__main__":
     test_preprocess_end = time.time()
     print("Test data loading and preprocessing time: ", test_preprocess_end - test_start)
 
+
     test_object_ids = [[plasma.ObjectID.from_random() for j in range(10)]
                         for i in range(test_rdd.getNumPartitions())]
+    test_save_start = time.time()
+    print("Saving test data files to plasma")
     test_res = test_rdd.mapPartitionsWithIndex(
         put_to_plasma(test_object_ids, object_store_address)).collect()
     test_save_end = time.time()
-    print("Test data saving time: ", test_save_end - save_start)
+    print("Test data saving time: ", test_save_end - test_save_start)
+    test_rdd.unpersist()
 
     test_data_map = {}
     test_size_map = {}

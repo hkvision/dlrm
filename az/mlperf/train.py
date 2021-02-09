@@ -68,6 +68,8 @@ print("Batches to test: ", test_batches)
 # 1 epoch first
 total_loss = 0
 total_samp = 0
+total_iter = 0
+total_time = 0
 # Can use the same code as in TrainingOperator
 for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
     ext_dist.barrier()
@@ -88,6 +90,8 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
     scheduler.step()
 
     t2 = time.time()
+    total_time += (t2 - t1)
+    total_iter += 1
     T = T.detach().cpu().numpy()
     mbs = T.shape[0]
     total_loss += L * mbs
@@ -96,9 +100,10 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
     should_print = ((j + 1) % config["print_freq"] == 0) or (j + 1 == nbatches)
     if should_print:
         gL = total_loss / total_samp
+        gT = 1000.0 * total_time / total_iter
         print(
             "Finished training it {}/{} of epoch {}, {:.2f} ms/it, ".format(
-                j + 1, nbatches, 1, (t2 - t1) *1000)
+                j + 1, nbatches, 1, gT)
             + "loss {:.6f}".format(gL)
         )
         total_loss = 0
@@ -150,6 +155,9 @@ for j, (X, lS_o, lS_i, T) in enumerate(train_ld):
             + " auc {:.4f}".format(validation_results['roc_auc'])
             + " accuracy {:3.3f} %".format(validation_results['accuracy'] * 100)
         )
+        if validation_results['roc_auc'] >= config["mlperf_auc_threshold"]:
+            print("AUC threshold reached!")
+            break
 
     if j + 1 == train_batches:  # Make sure all workers stop at the same time
         break
